@@ -193,6 +193,19 @@ def download_youtube_video(youtube_url: str, job_id: str) -> str:
             'format': 'best[height<=720]',  # Max 720p to keep file size reasonable
             'outtmpl': output_template,
             'quiet': False,
+            # Add these options to handle restrictions
+            'extract_flat': False,
+            'ignoreerrors': True,
+            'no_warnings': False,
+            # Simulate browser headers
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Accept-Encoding': 'gzip,deflate',
+                'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+                'Connection': 'keep-alive',
+            },
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -205,7 +218,6 @@ def download_youtube_video(youtube_url: str, job_id: str) -> str:
     except Exception as e:
         print(f"[{job_id}] YouTube download error: {str(e)}")
         raise Exception(f"YouTube download failed: {str(e)}")
-
 def process_video(job_id: str, video_path: str):
     """Process video (common function for both file upload and YouTube)"""
     try:
