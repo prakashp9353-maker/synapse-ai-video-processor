@@ -1,8 +1,0 @@
-[phases.setup]
-cmds = [
-    "apt-get update",
-    "apt-get install -y ffmpeg"
-]
-
-[start]
-cmd = "python main.py"
