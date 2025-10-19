@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import openai
@@ -7,12 +7,13 @@ import uuid
 import uvicorn
 import subprocess
 import tempfile
+import yt_dlp
 from typing import Dict, Any
 
 app = FastAPI(
     title="Synapse AI Video Processor",
     description="AI-powered educational video summarizer and quiz generator",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -32,8 +33,11 @@ results_db: Dict[str, Dict[str, Any]] = {}
 async def root():
     return {
         "message": "🚀 Synapse AI Video Processor API is running!",
+        "version": "2.0.0",
+        "features": ["File Upload", "YouTube URL Support"],
         "endpoints": {
             "upload": "POST /upload-video/",
+            "youtube": "POST /process-youtube/",
             "results": "GET /results/{job_id}",
             "health": "GET /health"
         },
@@ -42,13 +46,11 @@ async def root():
 
 @app.post("/upload-video/")
 async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Upload video for processing"""
+    """Upload video file for processing"""
     
-    # Validate file type
     if not file.content_type.startswith('video/'):
         raise HTTPException(status_code=400, detail="File must be a video")
     
-    # Check file size (max 25MB for free tier)
     max_size = 25 * 1024 * 1024
     file.file.seek(0, 2)
     file_size = file.file.tell()
@@ -57,31 +59,58 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
     if file_size > max_size:
         raise HTTPException(status_code=400, detail="File too large. Maximum size is 25MB")
     
-    # Generate unique job ID
     job_id = str(uuid.uuid4())
     
-    # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         content = await file.read()
         tmp_file.write(content)
         video_path = tmp_file.name
     
-    # Store initial job status
     results_db[job_id] = {
         "status": "processing",
+        "type": "file_upload",
         "filename": file.filename,
         "summary": "",
         "quiz": [],
         "error": None
     }
     
-    # Start background processing
     background_tasks.add_task(process_video, job_id, video_path)
     
     return JSONResponse({
         "job_id": job_id,
         "status": "processing",
-        "message": "Video uploaded and processing started"
+        "message": "Video uploaded and processing started",
+        "type": "file_upload"
+    })
+
+@app.post("/process-youtube/")
+async def process_youtube(background_tasks: BackgroundTasks, youtube_url: str = Form(...)):
+    """Process YouTube video from URL"""
+    
+    if not youtube_url or not (youtube_url.startswith('https://www.youtube.com/') or 
+                              youtube_url.startswith('https://youtu.be/') or
+                              youtube_url.startswith('https://youtube.com/')):
+        raise HTTPException(status_code=400, detail="Please provide a valid YouTube URL")
+    
+    job_id = str(uuid.uuid4())
+    
+    results_db[job_id] = {
+        "status": "processing",
+        "type": "youtube",
+        "youtube_url": youtube_url,
+        "summary": "",
+        "quiz": [],
+        "error": None
+    }
+    
+    background_tasks.add_task(download_and_process_youtube, job_id, youtube_url)
+    
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing", 
+        "message": "YouTube video download and processing started",
+        "type": "youtube"
     })
 
 @app.get("/results/{job_id}")
@@ -96,23 +125,32 @@ async def get_results(job_id: str):
         return JSONResponse({
             "job_id": job_id,
             "status": "processing",
+            "type": result.get("type", "unknown"),
             "message": "Still processing video..."
         })
     
     elif result["status"] == "completed":
-        return JSONResponse({
+        response_data = {
             "job_id": job_id,
             "status": "completed",
-            "filename": result["filename"],
+            "type": result.get("type", "unknown"),
             "summary": result["summary"],
             "quiz": result["quiz"],
             "message": "Processing completed successfully"
-        })
+        }
+        
+        if result["type"] == "file_upload":
+            response_data["filename"] = result["filename"]
+        elif result["type"] == "youtube":
+            response_data["youtube_url"] = result["youtube_url"]
+            
+        return JSONResponse(response_data)
     
     elif result["status"] == "error":
         return JSONResponse({
             "job_id": job_id,
             "status": "error",
+            "type": result.get("type", "unknown"),
             "error": result["error"],
             "message": "Processing failed"
         })
@@ -120,17 +158,62 @@ async def get_results(job_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "Synapse AI Backend"}
+    return {"status": "healthy", "service": "Synapse AI Backend", "version": "2.0.0"}
+
+def download_and_process_youtube(job_id: str, youtube_url: str):
+    """Download YouTube video and process it"""
+    try:
+        results_db[job_id]["status"] = "processing"
+        
+        # Step 1: Download YouTube video
+        print(f"[{job_id}] Downloading YouTube video...")
+        video_path = download_youtube_video(youtube_url, job_id)
+        
+        if not video_path:
+            raise Exception("Failed to download YouTube video")
+        
+        # Step 2: Process the downloaded video
+        process_video(job_id, video_path)
+        
+    except Exception as e:
+        print(f"[{job_id}] YouTube processing error: {str(e)}")
+        results_db[job_id].update({
+            "status": "error",
+            "error": str(e)
+        })
+
+def download_youtube_video(youtube_url: str, job_id: str) -> str:
+    """Download YouTube video and return file path"""
+    try:
+        # Create temp directory for download
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, f"youtube_{job_id}_%(title)s.%(ext)s")
+        
+        ydl_opts = {
+            'format': 'best[height<=720]',  # Max 720p to keep file size reasonable
+            'outtmpl': output_template,
+            'quiet': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=True)
+            downloaded_file = ydl.prepare_filename(info)
+            
+        print(f"[{job_id}] YouTube video downloaded: {downloaded_file}")
+        return downloaded_file
+        
+    except Exception as e:
+        print(f"[{job_id}] YouTube download error: {str(e)}")
+        raise Exception(f"YouTube download failed: {str(e)}")
 
 def process_video(job_id: str, video_path: str):
-    """Background task to process video using OpenAI APIs"""
+    """Process video (common function for both file upload and YouTube)"""
     try:
-        # Update status
         results_db[job_id]["status"] = "processing"
         
         # Step 1: Extract audio using ffmpeg
         print(f"[{job_id}] Extracting audio...")
-        audio_path = video_path.replace('.mp4', '.wav')
+        audio_path = video_path.replace('.mp4', '.wav').replace('.webm', '.wav').replace('.mkv', '.wav')
         
         cmd = [
             'ffmpeg', '-i', video_path,
@@ -201,9 +284,14 @@ def process_video(job_id: str, video_path: str):
         try:
             if os.path.exists(video_path):
                 os.remove(video_path)
-            audio_path = video_path.replace('.mp4', '.wav')
+            audio_path = video_path.replace('.mp4', '.wav').replace('.webm', '.wav').replace('.mkv', '.wav')
             if os.path.exists(audio_path):
                 os.remove(audio_path)
+            # Clean up YouTube download directory
+            temp_dir = os.path.dirname(video_path)
+            if "tmp" in temp_dir and os.path.exists(temp_dir):
+                import shutil
+                shutil.rmtree(temp_dir)
         except Exception as cleanup_error:
             print(f"Cleanup error: {cleanup_error}")
 
