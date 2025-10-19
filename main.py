@@ -1,0 +1,164 @@
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import os
+import uuid
+import uvicorn
+from typing import Dict, Any
+
+try:
+    from utils.ai_processor import AIProcessor
+except ImportError:
+    from ai_processor import AIProcessor
+
+app = FastAPI(
+    title="Synapse AI Video Processor",
+    description="AI-powered educational video summarizer and quiz generator",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ai_processor = AIProcessor()
+results_db: Dict[str, Dict[str, Any]] = {}
+
+@app.get("/")
+async def root():
+    return {
+        "message": "🚀 Synapse AI Video Processor API is running!",
+        "endpoints": {
+            "upload": "POST /upload-video/",
+            "results": "GET /results/{job_id}",
+            "health": "GET /health"
+        },
+        "status": "active"
+    }
+
+@app.post("/upload-video/")
+async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.content_type.startswith('video/'):
+        raise HTTPException(status_code=400, detail="File must be a video")
+    
+    max_size = 50 * 1024 * 1024
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    
+    if file_size > max_size:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB")
+    
+    job_id = str(uuid.uuid4())
+    temp_dir = "temp_uploads"
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, f"{job_id}_{file.filename}")
+    
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+    
+    results_db[job_id] = {
+        "status": "processing",
+        "filename": file.filename,
+        "summary": "",
+        "quiz": [],
+        "error": None
+    }
+    
+    background_tasks.add_task(process_video, job_id, file_path)
+    
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Video uploaded and processing started"
+    })
+
+@app.get("/results/{job_id}")
+async def get_results(job_id: str):
+    if job_id not in results_db:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    result = results_db[job_id]
+    
+    if result["status"] == "processing":
+        return JSONResponse({
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Still processing video..."
+        })
+    
+    elif result["status"] == "completed":
+        return JSONResponse({
+            "job_id": job_id,
+            "status": "completed",
+            "filename": result["filename"],
+            "summary": result["summary"],
+            "quiz": result["quiz"],
+            "message": "Processing completed successfully"
+        })
+    
+    elif result["status"] == "error":
+        return JSONResponse({
+            "job_id": job_id,
+            "status": "error",
+            "error": result["error"],
+            "message": "Processing failed"
+        })
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "Synapse AI Backend"}
+
+def process_video(job_id: str, video_path: str):
+    try:
+        results_db[job_id]["status"] = "processing"
+        
+        print(f"[{job_id}] Extracting audio...")
+        audio_path = ai_processor.extract_audio(video_path, f"temp_audio_{job_id}.wav")
+        
+        if not audio_path:
+            raise Exception("Failed to extract audio from video")
+        
+        print(f"[{job_id}] Transcribing audio...")
+        transcript = ai_processor.transcribe_audio(audio_path)
+        
+        print(f"[{job_id}] Generating summary...")
+        summary = ai_processor.summarize_text(transcript)
+        
+        print(f"[{job_id}] Generating quiz...")
+        quiz = ai_processor.generate_quiz(transcript, num_questions=3)
+        
+        results_db[job_id].update({
+            "status": "completed",
+            "summary": summary,
+            "quiz": quiz,
+            "transcript_length": len(transcript)
+        })
+        
+        print(f"[{job_id}] Processing completed successfully!")
+        
+    except Exception as e:
+        print(f"[{job_id}] Error: {str(e)}")
+        results_db[job_id].update({
+            "status": "error",
+            "error": str(e)
+        })
+    
+    finally:
+        try:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            audio_path = f"temp_audio_{job_id}.wav"
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+        except Exception as cleanup_error:
+            print(f"Cleanup error: {cleanup_error}")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
