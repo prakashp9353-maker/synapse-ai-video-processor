@@ -183,41 +183,109 @@ def download_and_process_youtube(job_id: str, youtube_url: str):
         })
 
 def download_youtube_video(youtube_url: str, job_id: str) -> str:
-    """Download YouTube video and return file path"""
+    """Download YouTube video with robust error handling"""
     try:
+        print(f"[{job_id}] Starting YouTube download: {youtube_url}")
+        
         # Create temp directory for download
         temp_dir = tempfile.mkdtemp()
         output_template = os.path.join(temp_dir, f"youtube_{job_id}_%(title)s.%(ext)s")
         
+        # Simplified options that work reliably
         ydl_opts = {
-            'format': 'best[height<=720]',  # Max 720p to keep file size reasonable
+            'format': 'best[height<=720]/best[height<=480]/best',
             'outtmpl': output_template,
             'quiet': False,
-            # Add these options to handle restrictions
-            'extract_flat': False,
-            'ignoreerrors': True,
             'no_warnings': False,
-            # Simulate browser headers
+            'ignoreerrors': True,
+            'extract_flat': False,
+            # Simulate a real browser
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Accept-Encoding': 'gzip,deflate',
-                'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
-                'Connection': 'keep-alive',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
             },
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            
-        print(f"[{job_id}] YouTube video downloaded: {downloaded_file}")
-        return downloaded_file
+        downloaded_file = None
         
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                # Extract info first to check if video is accessible
+                print(f"[{job_id}] Extracting video info...")
+                info = ydl.extract_info(youtube_url, download=False)
+                
+                if not info:
+                    raise Exception("Could not get video information")
+                
+                # Check for common restrictions
+                if info.get('age_limit', 0) > 0:
+                    raise Exception("Age-restricted video - please try a different video")
+                
+                if info.get('availability') == 'needs_auth':
+                    raise Exception("Video requires sign-in - please try a different video")
+                
+                print(f"[{job_id}] Video info extracted. Title: {info.get('title', 'Unknown')}")
+                print(f"[{job_id}] Starting download...")
+                
+                # Now download the video
+                ydl.download([youtube_url])
+                
+                # Find the actual downloaded file
+                downloaded_file = ydl.prepare_filename(info)
+                
+                # If the file doesn't exist, look for it in temp dir
+                if not os.path.exists(downloaded_file):
+                    for filename in os.listdir(temp_dir):
+                        if filename.startswith(f"youtube_{job_id}"):
+                            downloaded_file = os.path.join(temp_dir, filename)
+                            break
+                
+                if not downloaded_file or not os.path.exists(downloaded_file):
+                    raise Exception("Downloaded file not found")
+                
+                print(f"[{job_id}] Successfully downloaded: {downloaded_file}")
+                return downloaded_file
+                
+            except Exception as e:
+                print(f"[{job_id}] Download attempt failed: {str(e)}")
+                raise
+                
     except Exception as e:
         print(f"[{job_id}] YouTube download error: {str(e)}")
-        raise Exception(f"YouTube download failed: {str(e)}")
+        
+        # Provide user-friendly error messages
+        error_msg = str(e).lower()
+        if any(word in error_msg for word in ['sign in', 'login', 'bot', 'auth']):
+            raise Exception("This video requires sign-in verification. Please try a different YouTube video or use the file upload option.")
+        elif 'age restrict' in error_msg:
+            raise Exception("Age-restricted video. Please try a different educational video.")
+        elif 'unavailable' in error_msg or 'private' in error_msg:
+            raise Exception("Video is unavailable or private. Please try a different YouTube video.")
+        else:
+            raise Exception(f"YouTube download failed. Please try a different video or use file upload. Error: {str(e)}")
+def get_youtube_video_info(youtube_url: str):
+    """Get basic info about YouTube video before downloading"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            return {
+                'title': info.get('title', 'Unknown'),
+                'duration': info.get('duration', 0),
+                'view_count': info.get('view_count', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'is_live': info.get('is_live', False),
+            }
+    except Exception as e:
+        print(f"Error getting video info: {e}")
+        return None
 def process_video(job_id: str, video_path: str):
     """Process video (common function for both file upload and YouTube)"""
     try:
